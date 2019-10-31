@@ -10,7 +10,6 @@ GetOptions(
   'h|help'  => \my $help,
   'rt'      => \my $rt,
   'gh'      => \my $gh,
-  'token'   => \(my $token = $ENV{GITHUB_OAUTH_TOKEN}),
 ) or Pod::Usage::pod2usage(1);
 
 if ($help) {
@@ -35,21 +34,25 @@ for my $arg (@ARGV) {
     or $arg =~ /\Art#?([0-9]+)\z/i
     or $rt && $arg =~ /\A#?([0-9]+)\z/
   ) {
-    my $res = $rt_ua->get("https://rt.perl.org/Public/Bug/Display.html?id=$1");
+    my $rt_ticket = $1;
+    my $res = $rt_ua->get("https://rt.perl.org/Public/Bug/Display.html?id=$rt_ticket");
     if (my $loc = $res->{headers}{location}) {
       if ($loc =~ m{\Ahttps?://github\.com/Perl/perl/issues/([0-9]+)\z}i) {
         push @issues, $1;
         next;
       }
     }
-    warn "Unable to find GitHub issue for $arg\n";
+    warn "Unable to find GitHub issue for RT#$rt_ticket\n";
   }
   elsif (
-    $arg =~ /\Agh#?([0-9]+)\z/i
-    or $arg =~ m{\Ahttps://github\.com/Perl/perl5/issues/(\d+)\z}i
-    or $gh && $arg =~ /\A#?([0-9])\z/
+    $arg =~ m{\Agh#?([0-9]+)(?:/([0-9]+))?\z}i
+    or $arg =~ m{\Ahttps://github\.com/Perl/perl5/issues/(\d+)(?:#issuecomment-([0-9]+))?\z}i
+    or $gh && $arg =~ m{\A#?([0-9])(?:/([0-9]+))?\z}
   ) {
-    push @issues, $1;
+    my $issue = $1;
+    $issue .= "/$2"
+      if defined $2;
+    push @issues, $issue;
   }
   else {
     die "$arg does not look like an issue\n";
@@ -59,16 +62,10 @@ for my $arg (@ARGV) {
 my $ua = HTTP::Tiny->new;
 sub gh_req {
   my $url = shift;
-  my $res = $ua->get("https://api.github.com/$url", {
-    headers => {
-      (defined $token ? (
-        'Authorization' => "token $token",
-      ) : ()),
-    },
-  });
+  my $res = $ua->get("https://api.github.com/$url");
   if (!$res->{success}) {
     if ($res->{status} == 403) {
-      die "Hit GitHub rate limit! Try again providing a GitHub login token!\n";
+      die "Hit GitHub rate limit!\n";
     }
     die "Error querying GitHub:\n$res->{content}";
   }
@@ -76,30 +73,28 @@ sub gh_req {
 }
 
 for my $issue (@issues) {
-  print "Issue $issue: https://github.com/Perl/perl5/issues/$issue\n";
-  my $comments_res = $ua->get("https://api.github.com/repos/Perl/perl5/issues/$issue/comments");
-  if (!$comments_res->{success}) {
-    if ($comments_res->{status} == 403) {
-      die "Rate limited :(\n";
-    }
-    warn "Can't find GitHub issue $issue!\n";
-    next;
+  ($issue, my $comment) = split m{/}, $issue;
+  print "Issue $issue" . ($comment ? " comment $comment" : '') . ": https://github.com/Perl/perl5/issues/$issue" . ($comment ? "#issuecomment-$comment" : "") . "\n";
+
+  my $comments_data;
+  if ($comment) {
+    $comments_data = [
+      gh_req("repos/Perl/perl5/issues/comments/$comment"),
+    ];
   }
-  my $comments_data = decode_json($comments_res->{content});
+  else {
+    $comments_data = gh_req("repos/Perl/perl5/issues/$issue/comments");
+  }
+
+  my $found = 0;
   for my $comment (@$comments_data) {
-    my $comment_res = $ua->get($comment->{url});
-    if (!$comment_res->{success}) {
-      warn "Can't read GitHub issue $issue comment $comment->{id}!\n";
-      next;
-    }
-    my $comment_data = decode_json($comment_res->{content});
-    my $body = $comment_data->{body};
+    my $body = $comment->{body};
     while ($body =~ m{
       <details><summary>([^<]+)</summary>\n
       \n
       ```diff\n
       (.+?)
-      ```\n
+      \n```\n
       </details>\n
     }sgx) {
       my ($file, $patch) = ($1, $2);
@@ -115,8 +110,10 @@ for my $issue (@issues) {
         or die "Can't write to $write_file: $!\n";
       print $fh $patch;
       close $fh;
+      $found++;
     }
   }
+  print "Found $found patch".($found==1 ? '' : 'es').".\n";
 }
 
 __END__
@@ -134,15 +131,5 @@ gh-rt-patch-dl - Download patches migrated from Perl RT to GitHub
   $ gh-rt-patch-dl --rt 134118
   $ gh-rt-patch-dl rt#134118
   $ gh-rt-patch-dl https://rt.perl.org/Public/Bug/Display.html?id=
-
-=head1 RATE LIMITING
-
-GitHub rate limits API requests.  This script may make enough requests to go
-over the rate limit.  If this is an issue, a login token can be provided, as
-logged in users have significantly higher limits.
-
-The token can be provided using the C<--token=> option or the 
-C<GITHUB_OAUTH_TOKEN> environment variable.  Tokens can be created at
-L<https://github.com/settings/tokens>.
 
 =cut
